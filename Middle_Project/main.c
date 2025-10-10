@@ -4,250 +4,299 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <pthread.h>
+#include <errno.h>
 #include <ifaddrs.h>
 #include <netdb.h>
 
+#define MAX_CLIENTS 100
 #define BUFFER_SIZE 1024
-#define MAX_PEERS 100
 
 typedef struct {
+    int sock;
     char ip[INET_ADDRSTRLEN];
     int port;
-    int fd;
 } Peer;
 
-Peer peers[MAX_PEERS];
+Peer peers[MAX_CLIENTS];
 int peer_count = 0;
-int listen_sock;
+int server_port;
+char local_ip[INET_ADDRSTRLEN];
 
-// 🧠 Hàm lấy IP thật (bỏ qua 127.0.0.1)
-void get_local_ip(char *ip_str, size_t size) {
+// =========================
+// Lấy IP máy cục bộ
+// =========================
+void get_local_ip(char *ip_buffer) {
     struct ifaddrs *ifaddr, *ifa;
-    getifaddrs(&ifaddr);
+    int family;
+    ip_buffer[0] = '\0';
+
+    if (getifaddrs(&ifaddr) == -1) {
+        perror("getifaddrs");
+        strcpy(ip_buffer, "127.0.0.1");
+        return;
+    }
+
     for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
         if (ifa->ifa_addr == NULL) continue;
-        if (ifa->ifa_addr->sa_family == AF_INET) {
-            struct sockaddr_in *sa = (struct sockaddr_in *)ifa->ifa_addr;
-            inet_ntop(AF_INET, &sa->sin_addr, ip_str, size);
-            if (strcmp(ip_str, "127.0.0.1") != 0) break; // bỏ qua localhost
+        family = ifa->ifa_addr->sa_family;
+        if (family == AF_INET && strcmp(ifa->ifa_name, "lo") != 0) {
+            getnameinfo(ifa->ifa_addr, sizeof(struct sockaddr_in),
+                        ip_buffer, INET_ADDRSTRLEN,
+                        NULL, 0, NI_NUMERICHOST);
+            break;
         }
     }
+
     freeifaddrs(ifaddr);
+    if (strlen(ip_buffer) == 0) strcpy(ip_buffer, "127.0.0.1");
 }
 
-// 📨 Thread nhận tin nhắn
-void *receive_thread(void *arg) {
-    int fd = *(int *)arg;
-    free(arg);
+// =========================
+// Thêm peer
+// =========================
+void add_peer(int sock, const char *ip, int port) {
+    if (peer_count >= MAX_CLIENTS) return;
+    peers[peer_count].sock = sock;
+    strcpy(peers[peer_count].ip, ip);
+    peers[peer_count].port = port;
+    peer_count++;
+}
 
-    char buffer[BUFFER_SIZE];
-    char sender_ip[INET_ADDRSTRLEN];
-    int sender_port = 0;
-
-    // Lấy thông tin địa chỉ IP và port của peer gửi
-    struct sockaddr_in addr;
-    socklen_t addr_len = sizeof(addr);
-    getpeername(fd, (struct sockaddr *)&addr, &addr_len);
-    inet_ntop(AF_INET, &addr.sin_addr, sender_ip, sizeof(sender_ip));
-    sender_port = ntohs(addr.sin_port);
-
-    while (1) {
-        int n = recv(fd, buffer, sizeof(buffer) - 1, 0);
-        if (n <= 0) break;
-        buffer[n] = '\0';
-        printf("\n📩 Tin nhắn từ %s:%d → %s\n> ", sender_ip, sender_port, buffer);
-        fflush(stdout);
-    }
-
-    // Xoá peer khi ngắt kết nối
+// =========================
+// Xóa peer
+// =========================
+void remove_peer(const char *ip, int port) {
     for (int i = 0; i < peer_count; i++) {
-        if (peers[i].fd == fd) {
-            printf("\n⚠️  Peer %s:%d đã ngắt kết nối.\n> ", peers[i].ip, peers[i].port);
-            peers[i] = peers[peer_count - 1];
+        if (strcmp(peers[i].ip, ip) == 0 && peers[i].port == port) {
+            close(peers[i].sock);
+            for (int j = i; j < peer_count - 1; j++) {
+                peers[j] = peers[j + 1];
+            }
             peer_count--;
             break;
         }
     }
-    close(fd);
-    return NULL;
 }
 
-// 🧑‍💻 Thread server lắng nghe
-void *server_thread(void *arg) {
-    struct sockaddr_in client_addr;
-    socklen_t addr_len = sizeof(client_addr);
-
-    while (1) {
-        int conn_fd = accept(listen_sock, (struct sockaddr *)&client_addr, &addr_len);
-        if (conn_fd < 0) continue;
-
-        if (peer_count < MAX_PEERS) {
-            Peer p;
-            inet_ntop(AF_INET, &client_addr.sin_addr, p.ip, sizeof(p.ip));
-            p.port = ntohs(client_addr.sin_port);
-            p.fd = conn_fd;
-            peers[peer_count++] = p;
-
-            printf("\n📡 Máy %s:%d đã kết nối tới bạn\n> ", p.ip, p.port);
-            fflush(stdout);
-
-            pthread_t recv_tid;
-            int *fd_ptr = malloc(sizeof(int));
-            *fd_ptr = conn_fd;
-            pthread_create(&recv_tid, NULL, receive_thread, fd_ptr);
-            pthread_detach(recv_tid);
-        } else {
-            close(conn_fd);
-        }
-    }
-    return NULL;
-}
-
-// 📡 Hàm kết nối tới peer khác
-void connect_to_peer(const char *ip, int port) {
-    int sock_fd = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in peer_addr;
-    peer_addr.sin_family = AF_INET;
-    peer_addr.sin_port = htons(port);
-    inet_pton(AF_INET, ip, &peer_addr.sin_addr);
-
-    if (connect(sock_fd, (struct sockaddr *)&peer_addr, sizeof(peer_addr)) == 0) {
-        Peer p;
-        strcpy(p.ip, ip);
-        p.port = port;
-        p.fd = sock_fd;
-        peers[peer_count++] = p;
-
-        printf("✅ Đã kết nối tới %s:%d\n> ", ip, port);
-
-        pthread_t recv_tid;
-        int *fd_ptr = malloc(sizeof(int));
-        *fd_ptr = sock_fd;
-        pthread_create(&recv_tid, NULL, receive_thread, fd_ptr);
-        pthread_detach(recv_tid);
-    } else {
-        perror("❌ Kết nối thất bại");
-        close(sock_fd);
-    }
-}
-
-// 📝 Hiển thị danh sách peer
-void list_peers() {
-    printf("📜 Danh sách các kết nối:\n");
-    for (int i = 0; i < peer_count; i++) {
-        printf(" - %s:%d\n", peers[i].ip, peers[i].port);
-    }
-    if (peer_count == 0) printf(" (Không có kết nối nào)\n");
-}
-
-// 🔌 Ngắt kết nối 1 peer (terminate)
-void terminate_peer(const char *ip, int port) {
-    for (int i = 0; i < peer_count; i++) {
-        if (strcmp(peers[i].ip, ip) == 0 && peers[i].port == port) {
-            close(peers[i].fd);
-            peers[i] = peers[peer_count - 1];
-            peer_count--;
-            printf("❌ Đã ngắt kết nối %s:%d\n> ", ip, port);
-            return;
-        }
-    }
-    printf("⚠️ Không tìm thấy peer %s:%d\n> ", ip, port);
-}
-
-// 📴 Thoát toàn bộ
-void exit_all() {
-    for (int i = 0; i < peer_count; i++) {
-        close(peers[i].fd);
-    }
-    close(listen_sock);
-    printf("👋 Đã thoát chương trình.\n");
-    exit(0);
-}
-
-// 🆘 Lệnh help
-void show_help() {
-    printf("\n📖 Các lệnh hỗ trợ:\n");
-    printf("  connect <IP> <PORT>        - Kết nối tới peer khác\n");
-    printf("  send <IP> <PORT> <MSG>     - Gửi tin nhắn tới peer\n");
-    printf("  list                       - Liệt kê các peer đã kết nối\n");
-    printf("  terminate <IP> <PORT>      - Ngắt kết nối tới peer\n");
-    printf("  exit                       - Ngắt toàn bộ kết nối và thoát\n");
-    printf("  help                       - Hiển thị bảng hướng dẫn\n\n");
-}
-
-// 📬 Gửi tin nhắn
+// =========================
+// Gửi tin nhắn
+// =========================
 void send_message(const char *ip, int port, const char *msg) {
     for (int i = 0; i < peer_count; i++) {
         if (strcmp(peers[i].ip, ip) == 0 && peers[i].port == port) {
-            send(peers[i].fd, msg, strlen(msg), 0);
+            send(peers[i].sock, msg, strlen(msg), 0);
             return;
         }
     }
-    printf("⚠️ Peer %s:%d không tồn tại\n> ", ip, port);
+    printf("[!] Không tìm thấy kết nối tới %s:%d\n", ip, port);
 }
 
+// =========================
+// Xử lý nhận tin nhắn
+// =========================
+void *recv_thread(void *arg) {
+    Peer *peer = (Peer *)arg;
+    char buffer[BUFFER_SIZE];
+
+    while (1) {
+        ssize_t bytes = recv(peer->sock, buffer, sizeof(buffer)-1, 0);
+        if (bytes <= 0) {
+            printf("[-] Kết nối tới %s:%d đã bị ngắt.\n", peer->ip, peer->port);
+            remove_peer(peer->ip, peer->port);
+            break;
+        }
+
+        buffer[bytes] = '\0';
+
+        // Nếu nhận lệnh terminate
+        if (strcmp(buffer, "__TERMINATE__") == 0) {
+            printf("[!] %s:%d đã ngắt kết nối.\n", peer->ip, peer->port);
+            remove_peer(peer->ip, peer->port);
+            break;
+        }
+
+        printf("[%s:%d] %s\n", peer->ip, peer->port, buffer);
+    }
+
+    return NULL;
+}
+
+// =========================
+// Kết nối tới peer khác
+// =========================
+void connect_to_peer(const char *ip, int port) {
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in addr;
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    inet_pton(AF_INET, ip, &addr.sin_addr);
+
+    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("connect");
+        close(sock);
+        return;
+    }
+
+    struct sockaddr_in local_addr;
+    socklen_t len = sizeof(local_addr);
+    getsockname(sock, (struct sockaddr *)&local_addr, &len);
+
+    char my_ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &local_addr.sin_addr, my_ip, sizeof(my_ip));
+    int my_port = ntohs(local_addr.sin_port);
+
+    add_peer(sock, ip, port);
+    printf("[+] Đã kết nối tới %s:%d (local port %d)\n", ip, port, my_port);
+
+    pthread_t tid;
+    Peer *peer = malloc(sizeof(Peer));
+    *peer = peers[peer_count-1];
+    pthread_create(&tid, NULL, recv_thread, peer);
+    pthread_detach(tid);
+}
+
+// =========================
+// Thread lắng nghe kết nối
+// =========================
+void *server_thread(void *arg) {
+    int server_sock = *(int *)arg;
+    struct sockaddr_in client_addr;
+    socklen_t addr_size = sizeof(client_addr);
+
+    while (1) {
+        int client_sock = accept(server_sock, (struct sockaddr *)&client_addr, &addr_size);
+        if (client_sock < 0) continue;
+
+        char ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &client_addr.sin_addr, ip, sizeof(ip));
+        int port = ntohs(client_addr.sin_port);
+
+        add_peer(client_sock, ip, port);
+        printf("[+] Kết nối mới từ %s:%d\n", ip, port);
+
+        pthread_t tid;
+        Peer *peer = malloc(sizeof(Peer));
+        *peer = peers[peer_count-1];
+        pthread_create(&tid, NULL, recv_thread, peer);
+        pthread_detach(tid);
+    }
+
+    return NULL;
+}
+
+// =========================
+// Lệnh terminate
+// =========================
+void terminate_connection(const char *ip, int port) {
+    for (int i = 0; i < peer_count; i++) {
+        if (strcmp(peers[i].ip, ip) == 0 && peers[i].port == port) {
+            send(peers[i].sock, "__TERMINATE__", strlen("__TERMINATE__"), 0);
+            close(peers[i].sock);
+            remove_peer(ip, port);
+            printf("[x] Đã ngắt kết nối với %s:%d\n", ip, port);
+            return;
+        }
+    }
+    printf("[!] Không tìm thấy kết nối tới %s:%d\n", ip, port);
+}
+
+// =========================
+// Hiển thị danh sách kết nối
+// =========================
+void list_connections() {
+    printf("Các kết nối hiện tại (%d):\n", peer_count);
+    for (int i = 0; i < peer_count; i++) {
+        printf(" - %s:%d\n", peers[i].ip, peers[i].port);
+    }
+}
+
+// =========================
+// HELP
+// =========================
+void print_help() {
+    printf("Các lệnh hỗ trợ:\n");
+    printf("  connect <ip> <port>      : Kết nối tới một peer khác\n");
+    printf("  send <ip> <port> <msg>   : Gửi tin nhắn tới peer\n");
+    printf("  terminate <ip> <port>    : Ngắt kết nối với peer\n");
+    printf("  list                     : Liệt kê các kết nối hiện tại\n");
+    printf("  exit                     : Ngắt toàn bộ kết nối và thoát chương trình\n");
+    printf("  help                     : Hiển thị hướng dẫn\n");
+}
+
+// =========================
+// Main
+// =========================
 int main(int argc, char *argv[]) {
     if (argc != 2) {
-        printf("Cách dùng: %s <PORT>\n", argv[0]);
+        printf("Cách dùng: %s <port>\n", argv[0]);
         return 1;
     }
 
-    int port = atoi(argv[1]);
-    listen_sock = socket(AF_INET, SOCK_STREAM, 0);
+    server_port = atoi(argv[1]);
+    get_local_ip(local_ip);
+
+    int server_sock = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in server_addr;
     server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(server_port);
     server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(port);
-    bind(listen_sock, (struct sockaddr *)&server_addr, sizeof(server_addr));
-    listen(listen_sock, 5);
 
-    char local_ip[INET_ADDRSTRLEN];
-    get_local_ip(local_ip, sizeof(local_ip));
+    if (bind(server_sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        perror("bind");
+        return 1;
+    }
 
-    printf("🚀 Đã khởi tạo %s %d\n", local_ip, port);
-    printf("👉 Dùng \"help\" để hiển thị các lệnh\n");
+    listen(server_sock, 5);
 
     pthread_t server_tid;
-    pthread_create(&server_tid, NULL, server_thread, NULL);
+    pthread_create(&server_tid, NULL, server_thread, &server_sock);
     pthread_detach(server_tid);
 
-    char cmd[BUFFER_SIZE];
+    printf("[*] Đã khởi tạo %s:%d\n", local_ip, server_port);
+    printf("[*] Dùng \"help\" để hiển thị các lệnh\n");
+
+    char command[BUFFER_SIZE];
     while (1) {
         printf("> ");
         fflush(stdout);
-        if (!fgets(cmd, sizeof(cmd), stdin)) break;
+        if (!fgets(command, sizeof(command), stdin)) break;
 
-        char *args[4];
-        int n = 0;
-        char *token = strtok(cmd, " \n");
-        while (token && n < 4) {
-            args[n++] = token;
-            token = strtok(NULL, " \n");
+        command[strcspn(command, "\n")] = 0;
+        if (strncmp(command, "connect", 7) == 0) {
+            char ip[64]; int port;
+            if (sscanf(command, "connect %63s %d", ip, &port) == 2)
+                connect_to_peer(ip, port);
         }
-
-        if (n == 0) continue;
-
-        if (strcmp(args[0], "connect") == 0 && n == 3) {
-            connect_to_peer(args[1], atoi(args[2]));
-        } else if (strcmp(args[0], "send") == 0 && n >= 4) {
-            char msg[BUFFER_SIZE] = "";
-            for (int i = 3; i < n; i++) {
-                strcat(msg, args[i]);
-                if (i < n - 1) strcat(msg, " ");
+        else if (strncmp(command, "send", 4) == 0) {
+            char ip[64]; int port; char msg[BUFFER_SIZE];
+            if (sscanf(command, "send %63s %d %[^\n]", ip, &port, msg) == 3)
+                send_message(ip, port, msg);
+        }
+        else if (strncmp(command, "terminate", 9) == 0) {
+            char ip[64]; int port;
+            if (sscanf(command, "terminate %63s %d", ip, &port) == 2)
+                terminate_connection(ip, port);
+        }
+        else if (strcmp(command, "list") == 0) {
+            list_connections();
+        }
+        else if (strcmp(command, "exit") == 0) {
+            for (int i = 0; i < peer_count; i++) {
+                send(peers[i].sock, "__TERMINATE__", strlen("__TERMINATE__"), 0);
+                close(peers[i].sock);
             }
-            send_message(args[1], atoi(args[2]), msg);
-        } else if (strcmp(args[0], "list") == 0) {
-            list_peers();
-        } else if (strcmp(args[0], "terminate") == 0 && n == 3) {
-            terminate_peer(args[1], atoi(args[2]));
-        } else if (strcmp(args[0], "exit") == 0) {
-            exit_all();
-        } else if (strcmp(args[0], "help") == 0) {
-            show_help();
-        } else {
-            printf("⚠️ Lệnh không hợp lệ. Gõ \"help\" để xem hướng dẫn.\n");
+            peer_count = 0;
+            printf("[x] Đã ngắt toàn bộ kết nối. Thoát chương trình.\n");
+            break;
+        }
+        else if (strcmp(command, "help") == 0) {
+            print_help();
+        }
+        else if (strlen(command) > 0) {
+            printf("[!] Lệnh không hợp lệ. Gõ \"help\" để xem hướng dẫn.\n");
         }
     }
 
+    close(server_sock);
     return 0;
 }
