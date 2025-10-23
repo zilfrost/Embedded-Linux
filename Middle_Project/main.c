@@ -15,6 +15,7 @@ typedef struct {
     int sock;
     char ip[INET_ADDRSTRLEN];
     int port;
+    char local_ip[INET_ADDRSTRLEN];
 } Peer;
 
 Peer peers[MAX_CLIENTS];
@@ -54,11 +55,12 @@ void get_local_ip(char *ip_buffer) {
 // =========================
 // Thêm peer
 // =========================
-void add_peer(int sock, const char *ip, int port) {
+void add_peer(int sock, const char *ip, int port, const char *local_ip_conn) {
     if (peer_count >= MAX_CLIENTS) return;
     peers[peer_count].sock = sock;
     strcpy(peers[peer_count].ip, ip);
     peers[peer_count].port = port;
+    strcpy(peers[peer_count].local_ip, local_ip_conn);
     peer_count++;
 }
 
@@ -101,16 +103,17 @@ void *recv_thread(void *arg) {
     while (1) {
         ssize_t bytes = recv(peer->sock, buffer, sizeof(buffer)-1, 0);
         if (bytes <= 0) {
-            printf("[-] Kết nối tới %s:%d đã bị ngắt.\n", peer->ip, peer->port);
+            printf("[-] Kết nối Remote %s:%d đã bị ngắt.\n", 
+                   peer->ip, peer->port);
             remove_peer(peer->ip, peer->port);
             break;
         }
 
         buffer[bytes] = '\0';
 
-        // Nếu nhận lệnh terminate
         if (strcmp(buffer, "__TERMINATE__") == 0) {
-            printf("[!] %s:%d đã ngắt kết nối.\n", peer->ip, peer->port);
+            printf("[!] Remote %s:%d đã ngắt kết nối.\n", 
+                   peer->ip, peer->port);
             remove_peer(peer->ip, peer->port);
             break;
         }
@@ -126,6 +129,38 @@ void *recv_thread(void *arg) {
 // =========================
 void connect_to_peer(const char *ip, int port) {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        perror("socket client");
+        return;
+    }
+
+    // *** THAY ĐỔI: SET CẢ REUSEADDR VÀ REUSEPORT ***
+    int opt = 1;
+    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
+        perror("setsockopt(SO_REUSEADDR) for client");
+        close(sock);
+        return;
+    }
+    if (setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt))) {
+        perror("setsockopt(SO_REUSEPORT) for client");
+        close(sock);
+        return;
+    }
+    // *** KẾT THÚC THAY ĐỔI ***
+
+    // Bind vào INADDR_ANY
+    struct sockaddr_in local_bind_addr;
+    memset(&local_bind_addr, 0, sizeof(local_bind_addr));
+    local_bind_addr.sin_family = AF_INET;
+    local_bind_addr.sin_port = htons(server_port); 
+    local_bind_addr.sin_addr.s_addr = INADDR_ANY; // Bind vào 0.0.0.0
+
+    if (bind(sock, (struct sockaddr *)&local_bind_addr, sizeof(local_bind_addr)) < 0) {
+        perror("bind client socket"); 
+        close(sock);
+        return;
+    }
+
     struct sockaddr_in addr;
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
@@ -136,17 +171,23 @@ void connect_to_peer(const char *ip, int port) {
         close(sock);
         return;
     }
+    
+    // Lấy IP local mà KERNEL đã chọn
+    struct sockaddr_in actual_local_addr;
+    socklen_t len = sizeof(actual_local_addr);
+    char actual_local_ip[INET_ADDRSTRLEN];
+    
+    if (getsockname(sock, (struct sockaddr *)&actual_local_addr, &len) == 0) {
+        inet_ntop(AF_INET, &actual_local_addr.sin_addr, actual_local_ip, sizeof(actual_local_ip));
+    } else {
+        perror("getsockname after connect");
+        strcpy(actual_local_ip, "unknown"); 
+    }
 
-    struct sockaddr_in local_addr;
-    socklen_t len = sizeof(local_addr);
-    getsockname(sock, (struct sockaddr *)&local_addr, &len);
-
-    char my_ip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &local_addr.sin_addr, my_ip, sizeof(my_ip));
-    int my_port = ntohs(local_addr.sin_port);
-
-    add_peer(sock, ip, port);
-    printf("[+] Đã kết nối tới %s:%d (local port %d)\n", ip, port, my_port);
+    add_peer(sock, ip, port, actual_local_ip); 
+    
+    printf("[+] Đã kết nối tới %s:%d\n", 
+           ip, port);
 
     pthread_t tid;
     Peer *peer = malloc(sizeof(Peer));
@@ -171,8 +212,22 @@ void *server_thread(void *arg) {
         inet_ntop(AF_INET, &client_addr.sin_addr, ip, sizeof(ip));
         int port = ntohs(client_addr.sin_port);
 
-        add_peer(client_sock, ip, port);
-        printf("[+] Kết nối mới từ %s:%d\n", ip, port);
+        struct sockaddr_in local_conn_addr;
+        socklen_t local_conn_len = sizeof(local_conn_addr);
+        char local_conn_ip[INET_ADDRSTRLEN];
+        int local_conn_port = 0;
+
+        if (getsockname(client_sock, (struct sockaddr *)&local_conn_addr, &local_conn_len) == 0) {
+            inet_ntop(AF_INET, &local_conn_addr.sin_addr, local_conn_ip, sizeof(local_conn_ip));
+            local_conn_port = ntohs(local_conn_addr.sin_port);
+        } else {
+            strcpy(local_conn_ip, local_ip); 
+            local_conn_port = server_port;
+        }
+        
+        add_peer(client_sock, ip, port, local_conn_ip);
+        printf("[+] Kết nối mới từ %s:%d\n", 
+               ip, port);
 
         pthread_t tid;
         Peer *peer = malloc(sizeof(Peer));
@@ -192,8 +247,11 @@ void terminate_connection(const char *ip, int port) {
         if (strcmp(peers[i].ip, ip) == 0 && peers[i].port == port) {
             send(peers[i].sock, "__TERMINATE__", strlen("__TERMINATE__"), 0);
             close(peers[i].sock);
+            
+            printf("[x] Đã ngắt kết nối với %s:%d\n", 
+                   peers[i].ip, peers[i].port);
+            
             remove_peer(ip, port);
-            printf("[x] Đã ngắt kết nối với %s:%d\n", ip, port);
             return;
         }
     }
@@ -206,7 +264,8 @@ void terminate_connection(const char *ip, int port) {
 void list_connections() {
     printf("Các kết nối hiện tại (%d):\n", peer_count);
     for (int i = 0; i < peer_count; i++) {
-        printf(" - %s:%d\n", peers[i].ip, peers[i].port);
+        printf(" - Remote: %s:%d\n", 
+               peers[i].ip, peers[i].port);
     }
 }
 
@@ -215,7 +274,8 @@ void list_connections() {
 // =========================
 void print_help() {
     printf("Các lệnh hỗ trợ:\n");
-    printf("  connect <ip> <port>      : Kết nối tới một peer khác\n");
+    printf("  connect <ip> <port>      : Kết nối tới một peer khác.\n");
+    printf("                           (Dùng IP LAN/Public cho máy khác)\n");
     printf("  send <ip> <port> <msg>   : Gửi tin nhắn tới peer\n");
     printf("  terminate <ip> <port>    : Ngắt kết nối với peer\n");
     printf("  list                     : Liệt kê các kết nối hiện tại\n");
@@ -236,13 +296,37 @@ int main(int argc, char *argv[]) {
     get_local_ip(local_ip);
 
     int server_sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_sock < 0) {
+        perror("socket server");
+        return 1;
+    }
+
+    // *** THAY ĐỔI: SET CẢ REUSEADDR VÀ REUSEPORT ***
+    int opt = 1;
+    if (setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
+        perror("setsockopt(SO_REUSEADDR) for server");
+        close(server_sock);
+        return 1;
+    }
+    if (setsockopt(server_sock, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt))) {
+        perror("setsockopt(SO_REUSEPORT) for server");
+        close(server_sock);
+        return 1;
+    }
+    // *** KẾT THÚC THAY ĐỔI ***
+
+
     struct sockaddr_in server_addr;
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(server_port);
-    server_addr.sin_addr.s_addr = INADDR_ANY;
+    
+    // *** THAY ĐỔI: QUAY LẠI BIND VÀO INADDR_ANY ***
+    server_addr.sin_addr.s_addr = INADDR_ANY; // Server bind vào 0.0.0.0
+    // *** KẾT THÚC THAY ĐỔI ***
 
     if (bind(server_sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        perror("bind");
+        perror("bind server");
+        close(server_sock);
         return 1;
     }
 
