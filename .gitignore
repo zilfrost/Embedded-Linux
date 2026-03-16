@@ -1,0 +1,12 @@
+# User credentials file
+Middle_Project/users.txt
+
+# Build artifacts
+*.o
+*.a
+*.so
+*.out
+Middle_Project/p2p
+
+# Test files
+Middle_Project/*.txt

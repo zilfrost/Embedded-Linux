@@ -10,6 +10,10 @@
 
 #define MAX_CLIENTS 5
 #define BUFFER_SIZE 1024
+#define MAX_USERS 100
+#define MAX_USERNAME 50
+#define MAX_PASSWORD 50
+#define USERS_FILE "users.txt"
 
 typedef struct {
     int sock;
@@ -18,10 +22,22 @@ typedef struct {
     char local_ip[INET_ADDRSTRLEN];
 } Peer;
 
+typedef struct {
+    char username[MAX_USERNAME];
+    char password[MAX_PASSWORD];
+} User;
+
 Peer peers[MAX_CLIENTS];
 int peer_count = 0;
 int server_port;
 char local_ip[INET_ADDRSTRLEN];
+
+// Authentication state
+User users[MAX_USERS];
+int user_count = 0;
+int is_logged_in = 0;
+char current_username[MAX_USERNAME] = {0};
+pthread_mutex_t users_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // =========================
 // Lấy IP máy cục bộ
@@ -50,6 +66,132 @@ void get_local_ip(char *ip_buffer) {
 
     freeifaddrs(ifaddr);
     if (strlen(ip_buffer) == 0) strcpy(ip_buffer, "127.0.0.1");
+}
+
+// =========================
+// Load users from file
+// =========================
+void load_users() {
+    pthread_mutex_lock(&users_mutex);
+    FILE *f = fopen(USERS_FILE, "r");
+    if (f == NULL) {
+        pthread_mutex_unlock(&users_mutex);
+        return;
+    }
+
+    user_count = 0;
+    while (user_count < MAX_USERS &&
+           fscanf(f, "%49s %49s", users[user_count].username,
+                  users[user_count].password) == 2) {
+        user_count++;
+    }
+
+    fclose(f);
+    pthread_mutex_unlock(&users_mutex);
+}
+
+// =========================
+// Save users to file
+// =========================
+void save_users() {
+    pthread_mutex_lock(&users_mutex);
+    FILE *f = fopen(USERS_FILE, "w");
+    if (f == NULL) {
+        perror("fopen users file");
+        pthread_mutex_unlock(&users_mutex);
+        return;
+    }
+
+    for (int i = 0; i < user_count; i++) {
+        fprintf(f, "%s %s\n", users[i].username, users[i].password);
+    }
+
+    fclose(f);
+    pthread_mutex_unlock(&users_mutex);
+}
+
+// =========================
+// Register new user
+// =========================
+int register_user(const char *username, const char *password) {
+    if (strlen(username) == 0 || strlen(password) == 0) {
+        printf("[!] Tên đăng nhập và mật khẩu không được để trống.\n");
+        return 0;
+    }
+
+    pthread_mutex_lock(&users_mutex);
+
+    // Check if username already exists
+    for (int i = 0; i < user_count; i++) {
+        if (strcmp(users[i].username, username) == 0) {
+            pthread_mutex_unlock(&users_mutex);
+            printf("[!] Tên đăng nhập '%s' đã tồn tại.\n", username);
+            return 0;
+        }
+    }
+
+    // Add new user
+    if (user_count >= MAX_USERS) {
+        pthread_mutex_unlock(&users_mutex);
+        printf("[!] Không thể đăng ký thêm người dùng (đã đầy).\n");
+        return 0;
+    }
+
+    strncpy(users[user_count].username, username, MAX_USERNAME - 1);
+    users[user_count].username[MAX_USERNAME - 1] = '\0';
+    strncpy(users[user_count].password, password, MAX_PASSWORD - 1);
+    users[user_count].password[MAX_PASSWORD - 1] = '\0';
+    user_count++;
+
+    pthread_mutex_unlock(&users_mutex);
+
+    save_users();
+    printf("[+] Đã đăng ký người dùng '%s' thành công.\n", username);
+    return 1;
+}
+
+// =========================
+// Login user
+// =========================
+int login_user(const char *username, const char *password) {
+    if (is_logged_in) {
+        printf("[!] Bạn đã đăng nhập với tên '%s'. Vui lòng logout trước.\n",
+               current_username);
+        return 0;
+    }
+
+    pthread_mutex_lock(&users_mutex);
+
+    for (int i = 0; i < user_count; i++) {
+        if (strcmp(users[i].username, username) == 0 &&
+            strcmp(users[i].password, password) == 0) {
+            pthread_mutex_unlock(&users_mutex);
+
+            is_logged_in = 1;
+            strncpy(current_username, username, MAX_USERNAME - 1);
+            current_username[MAX_USERNAME - 1] = '\0';
+            printf("[+] Đăng nhập thành công. Xin chào, %s!\n", username);
+            return 1;
+        }
+    }
+
+    pthread_mutex_unlock(&users_mutex);
+    printf("[!] Tên đăng nhập hoặc mật khẩu không chính xác.\n");
+    return 0;
+}
+
+// =========================
+// Logout user
+// =========================
+void logout_user() {
+    if (!is_logged_in) {
+        printf("[!] Bạn chưa đăng nhập.\n");
+        return;
+    }
+
+    printf("[+] Đã đăng xuất người dùng '%s'.\n", current_username);
+    is_logged_in = 0;
+    current_username[0] = '\0';
 }
 
 // =========================
@@ -86,7 +228,9 @@ void remove_peer(const char *ip, int port) {
 void send_message(const char *ip, int port, const char *msg) {
     for (int i = 0; i < peer_count; i++) {
         if (strcmp(peers[i].ip, ip) == 0 && peers[i].port == port) {
-            send(peers[i].sock, msg, strlen(msg), 0);
+            char full_msg[BUFFER_SIZE];
+            snprintf(full_msg, sizeof(full_msg), "[%s]: %s", current_username, msg);
+            send(peers[i].sock, full_msg, strlen(full_msg), 0);
             return;
         }
     }
@@ -274,13 +418,16 @@ void list_connections() {
 // =========================
 void print_help() {
     printf("Các lệnh hỗ trợ:\n");
-    printf("  connect <ip> <port>      : Kết nối tới một peer khác.\n");
-    printf("                           (Dùng IP LAN/Public cho máy khác)\n");
-    printf("  send <ip> <port> <msg>   : Gửi tin nhắn tới peer\n");
-    printf("  terminate <ip> <port>    : Ngắt kết nối với peer\n");
-    printf("  list                     : Liệt kê các kết nối hiện tại\n");
-    printf("  exit                     : Ngắt toàn bộ kết nối và thoát chương trình\n");
-    printf("  help                     : Hiển thị hướng dẫn\n");
+    printf("  register <username> <password>  : Đăng ký tài khoản mới\n");
+    printf("  login <username> <password>     : Đăng nhập vào hệ thống\n");
+    printf("  logout                          : Đăng xuất khỏi hệ thống\n");
+    printf("  connect <ip> <port>             : Kết nối tới một peer khác.\n");
+    printf("                                    (Dùng IP LAN/Public cho máy khác)\n");
+    printf("  send <ip> <port> <msg>          : Gửi tin nhắn tới peer\n");
+    printf("  terminate <ip> <port>           : Ngắt kết nối với peer\n");
+    printf("  list                            : Liệt kê các kết nối hiện tại\n");
+    printf("  exit                            : Ngắt toàn bộ kết nối và thoát chương trình\n");
+    printf("  help                            : Hiển thị hướng dẫn\n");
 }
 
 // =========================
@@ -294,6 +441,9 @@ int main(int argc, char *argv[]) {
 
     server_port = atoi(argv[1]);
     get_local_ip(local_ip);
+
+    // Load user credentials from file
+    load_users();
 
     int server_sock = socket(AF_INET, SOCK_STREAM, 0);
     if (server_sock < 0) {
@@ -346,20 +496,49 @@ int main(int argc, char *argv[]) {
         if (!fgets(command, sizeof(command), stdin)) break;
 
         command[strcspn(command, "\n")] = 0;
-        if (strncmp(command, "connect", 7) == 0) {
-            char ip[64]; int port;
-            if (sscanf(command, "connect %63s %d", ip, &port) == 2)
-                connect_to_peer(ip, port);
+        if (strncmp(command, "register", 8) == 0) {
+            char username[MAX_USERNAME]; char password[MAX_PASSWORD];
+            if (sscanf(command, "register %49s %49s", username, password) == 2)
+                register_user(username, password);
+            else
+                printf("[!] Sử dụng: register <username> <password>\n");
+        }
+        else if (strncmp(command, "login", 5) == 0) {
+            char username[MAX_USERNAME]; char password[MAX_PASSWORD];
+            if (sscanf(command, "login %49s %49s", username, password) == 2)
+                login_user(username, password);
+            else
+                printf("[!] Sử dụng: login <username> <password>\n");
+        }
+        else if (strcmp(command, "logout") == 0) {
+            logout_user();
+        }
+        else if (strncmp(command, "connect", 7) == 0) {
+            if (!is_logged_in) {
+                printf("[!] Vui lòng đăng nhập trước khi sử dụng lệnh này.\n");
+            } else {
+                char ip[64]; int port;
+                if (sscanf(command, "connect %63s %d", ip, &port) == 2)
+                    connect_to_peer(ip, port);
+            }
         }
         else if (strncmp(command, "send", 4) == 0) {
-            char ip[64]; int port; char msg[BUFFER_SIZE];
-            if (sscanf(command, "send %63s %d %[^\n]", ip, &port, msg) == 3)
-                send_message(ip, port, msg);
+            if (!is_logged_in) {
+                printf("[!] Vui lòng đăng nhập trước khi sử dụng lệnh này.\n");
+            } else {
+                char ip[64]; int port; char msg[BUFFER_SIZE];
+                if (sscanf(command, "send %63s %d %[^\n]", ip, &port, msg) == 3)
+                    send_message(ip, port, msg);
+            }
         }
         else if (strncmp(command, "terminate", 9) == 0) {
-            char ip[64]; int port;
-            if (sscanf(command, "terminate %63s %d", ip, &port) == 2)
-                terminate_connection(ip, port);
+            if (!is_logged_in) {
+                printf("[!] Vui lòng đăng nhập trước khi sử dụng lệnh này.\n");
+            } else {
+                char ip[64]; int port;
+                if (sscanf(command, "terminate %63s %d", ip, &port) == 2)
+                    terminate_connection(ip, port);
+            }
         }
         else if (strcmp(command, "list") == 0) {
             list_connections();
