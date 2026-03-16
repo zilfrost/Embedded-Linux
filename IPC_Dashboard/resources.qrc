@@ -1,0 +1,10 @@
+<!DOCTYPE RCC>
+<RCC version="1.0">
+    <qresource prefix="/">
+        <file>qml/main.qml</file>
+        <file>qml/SpeedGauge.qml</file>
+        <file>qml/BatteryIndicator.qml</file>
+        <file>qml/GearIndicator.qml</file>
+        <file>qml/TurnSignal.qml</file>
+    </qresource>
+</RCC>
